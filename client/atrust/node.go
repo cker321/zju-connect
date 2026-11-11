@@ -2,6 +2,7 @@ package atrust
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"strconv"
 	"strings"
@@ -90,6 +91,13 @@ func getBestReachableNodes(nodeGroups map[string][]string, dialContext func(cont
 			for i, tcping := range pingList {
 				result := tcping.Result()
 				score, reachable := nodeProbeScore(result)
+				// Filter out non-tunnel ports (e.g. 1443 web port returned HTTP instead of tunnel protocol)
+				nodeParts := strings.Split(nodes[i], ":")
+				nodeHost := nodeParts[0]
+				nodePort, _ := strconv.Atoi(nodeParts[1])
+				if reachable && !isLikelyTunnelPort(nodeHost, nodePort, dialContext) {
+					reachable = false
+				}
 				if reachable && (bestScore == 0 || score < bestScore) {
 					bestNode = nodes[i]
 					bestScore = score
@@ -115,6 +123,44 @@ func nodeProbeScore(result *ping.Result) (time.Duration, bool) {
 		penalty = result.Target.Timeout
 	}
 	return result.Avg() + time.Duration(result.Failed())*penalty, true
+}
+
+func isLikelyTunnelPort(host string, port int, dialContext func(context.Context, string, string) (net.Conn, error)) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var rawConn net.Conn
+	var err error
+	if dialContext != nil {
+		rawConn, err = dialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	} else {
+		var dialer net.Dialer
+		rawConn, err = dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	if err != nil {
+		return true // fallback to allowing if connection failed
+	}
+	defer rawConn.Close()
+
+	tlsConn := tls.Client(rawConn, tunnelTLSConfig())
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return true
+	}
+	defer tlsConn.Close()
+
+	_ = tlsConn.SetDeadline(time.Now().Add(2 * time.Second))
+	// Probe with protocol prefix: if server responds with HTTP ("HTTP/1.1 400" starts with 0x48 0x54), it is not a tunnel node.
+	if _, err := tlsConn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return true
+	}
+	resp := make([]byte, 2)
+	n, err := tlsConn.Read(resp)
+	if err == nil && n >= 2 {
+		if resp[0] == 'H' && resp[1] == 'T' {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) updateBestNodes(ctx context.Context, updateBestNodesInterval int) {

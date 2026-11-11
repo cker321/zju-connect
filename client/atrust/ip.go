@@ -4,10 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
-	"net"
-	"strings"
 	"time"
 
 	"github.com/mythologyli/zju-connect/log"
@@ -35,58 +34,75 @@ func (c *Client) getIP() error {
 		_ = conn.Close()
 	}(conn)
 
-	msg := []byte{0x05, 0x01, 0xd0, 0x53, 0x00, 0x00, 0x53}
-	msg = append(msg, []byte(fmt.Sprintf(`{"sid":"%s"}`, c.SID))...)
-	if _, err := conn.Write(msg); err != nil {
+	req, err := json.Marshal(authRequestSID{Sid: c.SID})
+	if err != nil {
+		return fmt.Errorf("failed to marshal auth request: %w", err)
+	}
+
+	packet := wrapAuthReqData(req, 1)
+	if _, err := conn.Write(packet); err != nil {
 		return err
 	}
 
-	msg = []byte{0x05, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	if _, err := conn.Write(msg); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
 
-	for {
-		err = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		if err != nil {
-			return err
-		}
+	method := make([]byte, 2)
+	if _, err := io.ReadFull(conn, method); err != nil {
+		return fmt.Errorf("failed to read auth method: %w", err)
+	}
+	if method[0] != l3Version || method[1] != 0xD0 {
+		return fmt.Errorf("l3-tunnel unexpected auth method resp: %02x %02x", method[0], method[1])
+	}
 
-		header := make([]byte, 2)
-		_, err = io.ReadFull(conn, header)
-		if err != nil {
-			return err
-		}
-		if header[0] == 0x53 && header[1] == 0x00 {
-			lengthBytes := make([]byte, 2)
-			_, err = io.ReadFull(conn, lengthBytes)
-			if err != nil {
-				return err
-			}
-			length := binary.BigEndian.Uint16(lengthBytes)
-			data := make([]byte, length)
-			_, err = io.ReadFull(conn, data)
-			if err != nil {
-				return err
-			}
-
-			if !strings.Contains(string(data), "OK") {
-				return fmt.Errorf("failed to connect to the server: %s", string(data))
-			}
-		} else if header[0] == 0x05 && header[1] == 0x00 {
-			data := make([]byte, 6)
-			_, err = io.ReadFull(conn, data)
-			if err != nil {
-				return err
-			}
-			if data[0] != 0x00 || data[1] != 0x01 {
-				return fmt.Errorf("unexpected response: %x", data)
-			}
-
-			ip := net.IPv4(data[2], data[3], data[4], data[5])
-			c.setIP(ip)
-			log.Printf("Received IP: %s", ip.String())
-			return nil
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return fmt.Errorf("failed to read auth header: %w", err)
+	}
+	if header[0] != 0x53 {
+		return fmt.Errorf("l3-tunnel unexpected auth resp version: 0x%02x", header[0])
+	}
+	status := header[1]
+	length := int(binary.BigEndian.Uint16(header[2:4]))
+	payload := make([]byte, length)
+	if length > 0 {
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return fmt.Errorf("failed to read auth payload: %w", err)
 		}
 	}
+	if status != 0 {
+		return fmt.Errorf("l3-tunnel tunnel auth status %d", status)
+	}
+	if len(payload) > 0 {
+		var resp authResponseSID
+		if err := json.Unmarshal(payload, &resp); err != nil {
+			return fmt.Errorf("failed to unmarshal auth resp: %w", err)
+		}
+		if resp.Code != 0 {
+			return fmt.Errorf("l3-tunnel tunnel auth failed: %d %s", resp.Code, resp.Message)
+		}
+	}
+
+	vipHeader := make([]byte, 4)
+	if _, err := io.ReadFull(conn, vipHeader); err != nil {
+		return fmt.Errorf("failed to read vip header: %w", err)
+	}
+	dataLen, err := parseInitialVIPHeader(vipHeader)
+	if err != nil {
+		return fmt.Errorf("failed to parse vip header: %w", err)
+	}
+	vipData := make([]byte, dataLen)
+	if _, err := io.ReadFull(conn, vipData); err != nil {
+		return fmt.Errorf("failed to read vip data: %w", err)
+	}
+
+	ips := parseVirtualIPData(vipData)
+	if len(ips) == 0 {
+		return fmt.Errorf("no virtual IP received from server")
+	}
+
+	c.setIP(ips[0])
+	log.Printf("Received IP: %s", ips[0].String())
+	return nil
 }
